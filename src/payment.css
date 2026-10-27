@@ -1,0 +1,2 @@
+.mockqr{width:156px;height:156px;display:grid;place-items:center;margin:16px 0;border:8px solid #fff;outline:1px solid #dce8ec;background-color:#fff;background-image:linear-gradient(#fff,#fff),repeating-conic-gradient(#18313b 0 25%,#fff 0 50%);background-size:100% 28px,18px 18px;background-position:center,center;background-repeat:no-repeat,repeat;font-size:12px;font-weight:800}
+.profile-avatar{width:88px;height:88px;border-radius:50%;object-fit:cover}

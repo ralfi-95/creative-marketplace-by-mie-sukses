@@ -1,0 +1,3 @@
+.demo-matrix{width:156px;aspect-ratio:1;display:grid;grid-template-columns:repeat(21,1fr);gap:1px;background:#fff;border:8px solid #fff;outline:1px solid #cedde0}
+.demo-matrix i{background:#fff}.demo-matrix i.active{background:#17323b}
+.payment-simulation code{overflow-wrap:anywhere}.payment-simulation .orderactions{flex-wrap:wrap}

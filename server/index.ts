@@ -1,0 +1,131 @@
+import 'dotenv/config';
+import express, { type Request, type Response, type NextFunction } from 'express';
+import session from 'express-session';
+import connectPgSimple from 'connect-pg-simple';
+import bcrypt from 'bcryptjs';
+import multer from 'multer';
+import { randomUUID } from 'node:crypto';
+import path from 'node:path';
+import fs from 'node:fs';
+import { z, ZodError } from 'zod';
+import { pool } from './db/pool.js';
+import { createOrderTransitionHandler } from './orderTransition.js';
+import { createCheckoutHandler } from './checkout.js';
+import { createPaymentConfirmationHandler } from './payment.js';
+import { createDeliverableHandler } from './deliverables.js';
+import { createBuyerOrderListHandler, createOrderDetailHandler, createSellerOrderListHandler } from './orderLists.js';
+import { createPersonalWalletHandler, createWalletTopUpHandler, createWalletWithdrawalHandler } from './wallet.js';
+import { canReadDeliverable, canUploadDeliverable, validMediaSignature, validOfficeDocument } from './mediaPolicy.js';
+import { createAdminIssueListHandler, createMyOrderIssuesHandler, createOrderIssueHandler, createResolveOrderIssueHandler } from './orderIssues.js';
+import { createAdminTransactionHistoryHandler } from './adminTransactions.js';
+import { createAdminRoleApplicationsHandler, createMyRoleApplicationsHandler, createRoleApplicationHandler, createRoleApplicationReviewHandler } from './applications.js';
+import { isValidPhone, normalizePhone } from './contactPhone.js';
+import { createPublicSellerHandler, createServiceDetailHandler, createServiceListHandler } from './catalog.js';
+import { createOrderReviewHandler } from './reviews.js';
+const app=express(); const port=Number(process.env.PORT||3000); const webOrigin=process.env.WEB_ORIGIN||'http://127.0.0.1:5173'; const sessionSecret=process.env.SESSION_SECRET;
+if(!sessionSecret||sessionSecret.length<32)throw new Error('SESSION_SECRET must contain at least 32 characters.');
+const mediaRoot=path.resolve(process.env.UPLOAD_DIR||'./storage'); fs.mkdirSync(mediaRoot,{recursive:true});
+const PgSession=connectPgSimple(session);
+app.disable('x-powered-by'); app.use(express.json({limit:'100kb'}));
+app.use((req,res,next)=>{const changing=['POST','PUT','PATCH','DELETE'].includes(req.method);if((req.headers.origin&&req.headers.origin!==webOrigin)||(changing&&req.headers.origin!==webOrigin))return res.status(403).json({error:'CROSS_ORIGIN',message:'A same-origin request is required.'});next();});
+app.use(session({store:new PgSession({pool,tableName:'user_sessions',createTableIfMissing:false}),secret:sessionSecret,resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',maxAge:7*24*60*60*1000}}));
+type User={id:string; email:string; display_name:string;role:string;status:string;avatar_path?:string|null;contact_phone?:string|null;portfolio_url?:string|null};
+declare module 'express-session' { interface SessionData { userId?:string } }
+async function current(req:Request):Promise<User|null>{if(!req.session.userId)return null;const r=await pool.query('SELECT id,email,display_name,role,status,avatar_path,contact_phone,portfolio_url FROM users WHERE id=$1',[req.session.userId]);if(!r.rowCount||r.rows[0].status!=='active')return null;return r.rows[0] as User;}
+const auth=(req:Request,res:Response,next:NextFunction)=>{void current(req).then(u=>{if(!u){res.status(401).json({error:'UNAUTHENTICATED'});return;}res.locals.user=u;next();}).catch(next);};
+const role=(...roles:string[])=>[auth,(req:Request,res:Response,next:NextFunction)=>{if(!roles.includes(res.locals.user.role)){res.status(403).json({error:'FORBIDDEN'});return;}next();}];
+const asyncRoute=(fn:(req:Request,res:Response)=>Promise<unknown>)=>(req:Request,res:Response,next:NextFunction)=>{void fn(req,res).catch(next);};
+app.get('/media/:filename',asyncRoute(async(req,res)=>{
+ const filename=req.params.filename;
+ if(path.basename(filename)!==filename||!/^([0-9a-f-]{36}\.(png|jpg|webp|pdf|doc|docx)|demo-(edit|photo|design|ui)\.svg)$/i.test(filename))return res.status(404).end();
+ const objectPath=`/media/${filename}`;
+ const result=await pool.query("SELECT m.kind,m.owner_id,u.role,u.status,u.avatar_path,EXISTS(SELECT 1 FROM services s JOIN users seller ON seller.id=s.seller_id WHERE s.thumbnail_path=m.path AND s.status='published' AND seller.status='active') is_public FROM media_uploads m JOIN users u ON u.id=m.owner_id WHERE m.path=$1",[objectPath]);
+ if(!result.rowCount)return res.status(404).end();
+ const media=result.rows[0];
+ let allowed=media.kind==='service'&&media.is_public;
+ if(media.kind==='avatar'&&media.role==='seller'&&media.status==='active'&&media.avatar_path===objectPath)allowed=true;
+ let user:User|null=null;
+ if(media.kind==='deliverable'||media.kind==='application'||!allowed){user=await current(req);if(media.kind==='deliverable'&&user){let hasOrderAccess=false;if(user.id!==media.owner_id){const access=await pool.query('SELECT 1 FROM order_deliverables d JOIN orders o ON o.id=d.order_id WHERE d.media_path=$1 AND ($2=o.buyer_id OR $3=true)',[objectPath,user.id,user.role==='admin']);hasOrderAccess=Boolean(access.rowCount);}allowed=canReadDeliverable(user.id,media.owner_id,hasOrderAccess);}else allowed=Boolean(user&&(user.id===media.owner_id||(media.kind==='application'&&user.role==='admin')));}
+ if(!allowed)return res.status(404).end();
+ if(media.kind==='deliverable')return res.download(path.join(mediaRoot,filename));
+ res.sendFile(path.join(mediaRoot,filename));
+}));
+const categories=[['video-foto-editing','Video & Foto Editing'],['fotografi','Fotografi'],['desain-grafis','Desain Grafis'],['ui-ux-design','UI/UX Design']];
+app.get('/api/health',asyncRoute(async(_req,res)=>{const r=await pool.query('select current_database() db');res.json({ok:true,database:r.rows[0].db});}));
+app.post('/api/auth/register',asyncRoute(async(req,res)=>{const b=z.object({email:z.string().email().max(254),password:z.string().min(10).max(72),displayName:z.string().trim().min(2).max(80),contactPhone:z.string().trim().max(30).optional().refine(value=>!value||isValidPhone(value))}).parse(req.body);await new Promise<void>((resolve,reject)=>req.session.regenerate(err=>err?reject(err):resolve()));const hash=await bcrypt.hash(b.password,12),phone=b.contactPhone?normalizePhone(b.contactPhone):null;const r=await pool.query('INSERT INTO users(email,password_hash,display_name,contact_phone) VALUES(lower($1),$2,$3,$4) RETURNING id,email,display_name,role,status,contact_phone',[b.email,hash,b.displayName,phone]);req.session.userId=r.rows[0].id;res.status(201).json({user:r.rows[0]});}));
+app.post('/api/auth/login',asyncRoute(async(req,res)=>{const b=z.object({email:z.string().email(),password:z.string().min(1).max(72)}).parse(req.body);const r=await pool.query('SELECT id,email,display_name,role,status,password_hash FROM users WHERE email=lower($1)',[b.email]);if(!r.rowCount||r.rows[0].status!=='active'||!await bcrypt.compare(b.password,r.rows[0].password_hash))return res.status(401).json({error:'INVALID_CREDENTIALS'});req.session.regenerate(err=>{if(err)return res.status(500).json({error:'SESSION_ERROR'});req.session.userId=r.rows[0].id;res.json({user:{id:r.rows[0].id,email:r.rows[0].email,display_name:r.rows[0].display_name,role:r.rows[0].role,status:r.rows[0].status}});});}));
+app.post('/api/auth/logout',auth,asyncRoute(async(req,res)=>req.session.destroy(()=>res.status(204).end())));
+app.get('/api/auth/me',asyncRoute(async(req,res)=>{const user=await current(req);res.json({user});}));
+app.get('/api/categories',asyncRoute(async(_req,res)=>res.json({categories:(await pool.query('SELECT id,slug,name FROM categories WHERE is_active ORDER BY name')).rows})));
+app.get('/api/services',asyncRoute(createServiceListHandler(pool)));
+app.get('/api/services/:id',asyncRoute(createServiceDetailHandler(pool)));
+app.get('/api/sellers/:id',asyncRoute(createPublicSellerHandler(pool)));
+const mediaExtensions:Record<string,string>={'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp','application/pdf':'.pdf','application/msword':'.doc','application/vnd.openxmlformats-officedocument.wordprocessingml.document':'.docx'};
+const upload=multer({storage:multer.diskStorage({destination:(_req,_file,cb)=>cb(null,mediaRoot),filename:(_req,file,cb)=>cb(null,`${randomUUID()}${mediaExtensions[file.mimetype]||'.bin'}`),}),limits:{fileSize:5*1024*1024,files:1},fileFilter:(_req,file,cb)=>cb(null,Object.hasOwn(mediaExtensions,file.mimetype))});
+app.post('/api/media',auth,upload.single('file'),asyncRoute(async(req,res)=>{
+ if(!req.file)return res.status(400).json({error:'INVALID_FILE'});
+ const bytes=await fs.promises.readFile(req.file.path);
+ const kindSchema=z.enum(['avatar','service','deliverable','application']);
+ const parsed=kindSchema.safeParse(req.body.kind);
+ if(!parsed.success){await fs.promises.unlink(req.file.path);return res.status(400).json({error:'INVALID_MEDIA_PURPOSE'});}
+ const kind=parsed.data,user=res.locals.user;
+ const imageMime=['image/png','image/jpeg','image/webp'].includes(req.file.mimetype);
+ const standardFile=(imageMime||req.file.mimetype==='application/pdf')&&validMediaSignature(bytes);
+ const officeFile=['deliverable','application'].includes(kind)&&validOfficeDocument(bytes,req.file.mimetype);
+ if((!standardFile&&!officeFile)||(['avatar','service'].includes(kind)&&!imageMime)){await fs.promises.unlink(req.file.path);return res.status(400).json({error:'INVALID_FILE'});}
+ if(kind==='service'&&user.role!=='seller'){await fs.promises.unlink(req.file.path);return res.status(403).json({error:'FORBIDDEN'});}
+ if(kind==='application'&&!['buyer','seller'].includes(user.role)){await fs.promises.unlink(req.file.path);return res.status(403).json({error:'FORBIDDEN'});}
+ let orderId:string|null=null;
+ if(kind==='deliverable'){
+  const id=z.string().uuid().safeParse(req.body.orderId);
+  if(user.role!=='seller'||!id.success){await fs.promises.unlink(req.file.path);return res.status(403).json({error:'FORBIDDEN'});}
+  const order=await pool.query('SELECT seller_id,status FROM orders WHERE id=$1',[id.data]);
+  if(!order.rowCount||!canUploadDeliverable(user.role,user.id,order.rows[0].seller_id,order.rows[0].status)){await fs.promises.unlink(req.file.path);return res.status(409).json({error:'ORDER_NOT_READY_FOR_DELIVERY'});}
+  orderId=id.data;
+ }
+ const objectPath=`/media/${req.file.filename}`;
+ try{
+  await pool.query('INSERT INTO media_uploads(path,owner_id,kind,order_id) VALUES($1,$2,$3,$4)',[objectPath,user.id,kind,orderId]);
+  if(kind==='avatar')await pool.query('UPDATE users SET avatar_path=$1 WHERE id=$2',[objectPath,user.id]);
+ }catch(error){await fs.promises.unlink(req.file.path);throw error;}
+ res.status(201).json({path:objectPath});
+}));
+app.put('/api/profile',auth,asyncRoute(async(req,res)=>{const b=z.object({displayName:z.string().trim().min(2).max(80).optional(),contactPhone:z.string().trim().max(30).optional().refine(value=>!value||isValidPhone(value))}).refine(value=>value.displayName!==undefined||value.contactPhone!==undefined);const profile=b.parse(req.body),phone=profile.contactPhone?normalizePhone(profile.contactPhone):null;const r=await pool.query('UPDATE users SET display_name=coalesce($1,display_name),contact_phone=coalesce($2,contact_phone) WHERE id=$3 RETURNING id,email,display_name,role,status,avatar_path,contact_phone',[profile.displayName||null,phone,res.locals.user.id]);res.json({user:r.rows[0]});}));
+app.put('/api/profile/password',auth,asyncRoute(async(req,res)=>{const b=z.object({currentPassword:z.string().min(1).max(72),newPassword:z.string().min(10).max(72)}).parse(req.body),client=await pool.connect();try{await client.query('BEGIN');const row=await client.query('SELECT password_hash FROM users WHERE id=$1 FOR UPDATE',[res.locals.user.id]);if(!row.rowCount||!await bcrypt.compare(b.currentPassword,row.rows[0].password_hash))throw Object.assign(new Error('Current password is incorrect.'),{status:400,code:'INVALID_CURRENT_PASSWORD'});await client.query('UPDATE users SET password_hash=$1 WHERE id=$2',[await bcrypt.hash(b.newPassword,12),res.locals.user.id]);await client.query('COMMIT');res.json({ok:true});}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}}));
+app.get('/api/cart',auth,asyncRoute(async(_req,res)=>{const id=res.locals.user.id;const c=await pool.query('INSERT INTO carts(buyer_id) VALUES($1) ON CONFLICT(buyer_id) DO UPDATE SET updated_at=now() RETURNING id',[id]);const items=await pool.query("SELECT s.id service_id,s.title,s.price_idr,s.thumbnail_path,u.display_name seller_name,u.id seller_id,c.name category_name FROM cart_items i JOIN services s ON s.id=i.service_id JOIN users u ON u.id=s.seller_id JOIN categories c ON c.id=s.category_id WHERE i.cart_id=$1 ORDER BY i.created_at",[c.rows[0].id]);res.json({items:items.rows});}));
+app.get('/api/wallet',auth,asyncRoute(createPersonalWalletHandler(pool)));
+app.post('/api/wallet/topups',auth,asyncRoute(createWalletTopUpHandler(pool)));
+app.post('/api/wallet/withdrawals',auth,asyncRoute(createWalletWithdrawalHandler(pool)));
+app.post('/api/cart/:serviceId',auth,asyncRoute(async(req,res)=>{const id=res.locals.user.id;const s=await pool.query("SELECT s.id,s.seller_id FROM services s JOIN users u ON u.id=s.seller_id JOIN categories c ON c.id=s.category_id WHERE s.id=$1 AND s.status='published' AND u.status='active' AND u.role='seller' AND c.is_active",[req.params.serviceId]);if(!s.rowCount)return res.status(404).json({error:'SERVICE_UNAVAILABLE'});if(s.rows[0].seller_id===id)return res.status(409).json({error:'OWN_SERVICE'});const c=await pool.query('INSERT INTO carts(buyer_id) VALUES($1) ON CONFLICT(buyer_id) DO UPDATE SET updated_at=now() RETURNING id',[id]);try{await pool.query('INSERT INTO cart_items(cart_id,service_id) VALUES($1,$2)',[c.rows[0].id,req.params.serviceId]);}catch(e){if((e as {code?:string}).code==='23505')return res.status(409).json({error:'ALREADY_IN_CART'});throw e;}res.status(201).json({ok:true});}));
+app.delete('/api/cart/:serviceId',auth,asyncRoute(async(req,res)=>{await pool.query('DELETE FROM cart_items i USING carts c WHERE i.cart_id=c.id AND c.buyer_id=$1 AND i.service_id=$2',[res.locals.user.id,req.params.serviceId]);res.status(204).end();}));
+app.post('/api/checkout',auth,asyncRoute(createCheckoutHandler(pool)));
+app.post('/api/checkout/:batchId/payment/confirm',auth,asyncRoute(createPaymentConfirmationHandler(pool)));
+app.get('/api/buyer/orders',auth,asyncRoute(createBuyerOrderListHandler(pool)));
+app.get('/api/orders',auth,asyncRoute(createBuyerOrderListHandler(pool)));
+app.get('/api/orders/:id',auth,asyncRoute(createOrderDetailHandler(pool)));
+app.put('/api/orders/:id/review',auth,asyncRoute(createOrderReviewHandler(pool)));
+app.post('/api/orders/:id/transition',auth,asyncRoute(createOrderTransitionHandler(pool)));
+app.post('/api/orders/:id/issues',auth,asyncRoute(createOrderIssueHandler(pool)));
+app.get('/api/order-issues/mine',auth,asyncRoute(createMyOrderIssuesHandler(pool)));
+app.post('/api/orders/:id/deliverables',role('seller'),asyncRoute(createDeliverableHandler(pool)));
+app.post('/api/seller/applications',auth,asyncRoute(createRoleApplicationHandler(pool)));
+app.get('/api/seller/applications/mine',auth,asyncRoute(createMyRoleApplicationsHandler(pool)));
+app.get('/api/seller/services',role('seller'),asyncRoute(async(_req,res)=>{const r=await pool.query('SELECT s.*,c.name category_name FROM services s JOIN categories c ON c.id=s.category_id WHERE seller_id=$1 ORDER BY created_at DESC',[res.locals.user.id]);res.json({services:r.rows});}));
+app.get('/api/seller/profile',role('seller'),asyncRoute(async(_req,res)=>{const r=await pool.query('SELECT contact_phone,portfolio_url FROM users WHERE id=$1',[res.locals.user.id]);res.json(r.rows[0]);}));
+app.put('/api/seller/profile',role('seller'),asyncRoute(async(req,res)=>{const b=z.object({contactPhone:z.string().trim().max(30).refine(isValidPhone),portfolioUrl:z.string().url().refine(x=>['http:','https:'].includes(new URL(x).protocol))}).parse(req.body);await pool.query('UPDATE users SET contact_phone=$1,portfolio_url=$2 WHERE id=$3',[normalizePhone(b.contactPhone),b.portfolioUrl,res.locals.user.id]);res.json({ok:true});}));
+const serviceSchema=z.object({title:z.string().trim().min(5).max(100),description:z.string().trim().min(1).max(10000),priceIdr:z.number().int().min(10000).safe(),estimatedDays:z.number().int().positive().safe(),categoryId:z.string().uuid(),thumbnailPath:z.string().max(500).nullable().optional(),status:z.enum(['draft','published','archived'])});
+app.post('/api/seller/services',role('seller'),asyncRoute(async(req,res)=>{const b=serviceSchema.parse(req.body);if(b.status==='published'&&!b.thumbnailPath)return res.status(400).json({error:'THUMBNAIL_REQUIRED'});const cat=await pool.query('SELECT 1 FROM categories WHERE id=$1 AND is_active',[b.categoryId]);if(!cat.rowCount)return res.status(400).json({error:'INVALID_CATEGORY'});if(b.thumbnailPath){const media=await pool.query("SELECT 1 FROM media_uploads WHERE path=$1 AND owner_id=$2 AND kind='service'",[b.thumbnailPath,res.locals.user.id]);if(!media.rowCount)return res.status(400).json({error:'INVALID_THUMBNAIL'});}const r=await pool.query('INSERT INTO services(seller_id,category_id,title,description,price_idr,estimated_days,thumbnail_path,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',[res.locals.user.id,b.categoryId,b.title,b.description,b.priceIdr,b.estimatedDays,b.thumbnailPath||null,b.status]);res.status(201).json({service:r.rows[0]});}));
+app.put('/api/seller/services/:id',role('seller'),asyncRoute(async(req,res)=>{const b=serviceSchema.parse(req.body);if(b.status==='published'&&!b.thumbnailPath)return res.status(400).json({error:'THUMBNAIL_REQUIRED'});const cat=await pool.query('SELECT 1 FROM categories WHERE id=$1 AND is_active',[b.categoryId]);if(!cat.rowCount)return res.status(400).json({error:'INVALID_CATEGORY'});if(b.thumbnailPath){const media=await pool.query("SELECT 1 FROM media_uploads WHERE path=$1 AND owner_id=$2 AND kind='service'",[b.thumbnailPath,res.locals.user.id]);if(!media.rowCount)return res.status(400).json({error:'INVALID_THUMBNAIL'});}const r=await pool.query("UPDATE services SET category_id=$1,title=$2,description=$3,price_idr=$4,estimated_days=$5,thumbnail_path=$6,status=$7,updated_at=now() WHERE id=$8 AND seller_id=$9 AND status<>'suspended' RETURNING *",[b.categoryId,b.title,b.description,b.priceIdr,b.estimatedDays,b.thumbnailPath||null,b.status,req.params.id,res.locals.user.id]);if(!r.rowCount)return res.status(404).json({error:'NOT_FOUND_OR_MODERATED'});res.json({service:r.rows[0]});}));
+app.get('/api/seller/orders',role('seller'),asyncRoute(createSellerOrderListHandler(pool)));
+app.get('/api/admin/applications',role('admin'),asyncRoute(createAdminRoleApplicationsHandler(pool)));
+app.post('/api/admin/applications/:id/review',role('admin'),asyncRoute(createRoleApplicationReviewHandler(pool)));
+app.get('/api/admin/services',role('admin'),asyncRoute(async(_req,res)=>{res.json({services:(await pool.query('SELECT s.*,u.display_name seller_name FROM services s JOIN users u ON u.id=s.seller_id ORDER BY created_at DESC')).rows});}));
+app.post('/api/admin/services/:id/suspend',role('admin'),asyncRoute(async(req,res)=>{const r=await pool.query("UPDATE services SET status='suspended',updated_at=now() WHERE id=$1 RETURNING id",[req.params.id]);if(!r.rowCount)return res.status(404).json({error:'NOT_FOUND'});await pool.query('INSERT INTO audit_events(actor_id,action,target_type,target_id) VALUES($1,$2,$3,$4)',[res.locals.user.id,'service_suspended','service',req.params.id]);res.json({ok:true});}));
+app.post('/api/admin/services/:id/restore',role('admin'),asyncRoute(async(req,res)=>{const r=await pool.query("UPDATE services SET status='published',updated_at=now() WHERE id=$1 AND status='suspended' RETURNING id",[req.params.id]);if(!r.rowCount)return res.status(409).json({error:'SERVICE_NOT_SUSPENDED'});await pool.query('INSERT INTO audit_events(actor_id,action,target_type,target_id) VALUES($1,$2,$3,$4)',[res.locals.user.id,'service_restored','service',req.params.id]);res.json({ok:true});}));
+app.get('/api/admin/transactions',role('admin'),asyncRoute(createAdminTransactionHistoryHandler(pool)));
+app.get('/api/admin/issues',role('admin'),asyncRoute(createAdminIssueListHandler(pool)));
+app.post('/api/admin/issues/:id/resolve',role('admin'),asyncRoute(createResolveOrderIssueHandler(pool)));
+app.get('/api/admin/events',role('admin'),asyncRoute(async(_req,res)=>res.json({events:(await pool.query('SELECT e.*,u.display_name actor_name FROM audit_events e JOIN users u ON u.id=e.actor_id ORDER BY e.created_at DESC LIMIT 100')).rows})));
+if(process.env.NODE_ENV==='production'){const web=path.resolve('dist');app.use(express.static(web));app.get('*',(req,res,next)=>req.path.startsWith('/api/')?next():res.sendFile(path.join(web,'index.html')));}
+app.use((err:unknown,_req:Request,res:Response,_next:NextFunction)=>{if(err instanceof ZodError)return res.status(400).json({error:'VALIDATION',issues:err.issues.map(i=>({path:i.path,message:i.message}))});const e=err as {status?:number;code?:string;message?:string};if(e.code?.startsWith('LIMIT_'))return res.status(413).json({error:'UPLOAD_LIMIT'});if(e.code==='22P02')return res.status(400).json({error:'INVALID_ID'});res.status(e.status|| (e.code==='23505'?409:500)).json({error:e.code||'INTERNAL_ERROR',message:e.status?e.message:undefined});});
+const start=async()=>{const r=await pool.query('select current_database() db,current_user role');if(r.rows[0].db!=='mie_sukses_marketplace'||r.rows[0].role!=='marketplace_app')throw new Error('Refusing startup: expected local mie_sukses_marketplace as marketplace_app.');app.listen(port,'127.0.0.1',()=>console.log(`API listening on http://127.0.0.1:${port} (${r.rows[0].db})`));};void start().catch(e=>{console.error('Startup failed:',e.message);process.exit(1);});

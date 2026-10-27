@@ -1,0 +1,36 @@
+import { useEffect, useState, type FormEvent } from 'react';
+import { Link, useParams } from 'react-router-dom';
+import { askReason, confirmAction } from './FinalFeatures';
+import { PaymentSimulation } from './PaymentSimulation';
+import { formatRupiah as money, orderStatusLabel as statusLabel } from './format';
+import { StatusBadge } from './StatusBadge';
+
+type User={id:string;role:string};
+async function api<T>(path:string,options:RequestInit={}):Promise<T>{const response=await fetch(`/api${path}`,{credentials:'include',...options,headers:{...(options.body instanceof FormData?{}:{'Content-Type':'application/json'}),...options.headers}});if(!response.ok){const result=await response.json().catch(()=>({}));throw new Error(result.message||result.error||'Request failed.');}return response.json();}
+
+export function OrderDetail({user}:{user:User|null}){
+ const {id}=useParams(),[data,setData]=useState<any>(),[error,setError]=useState(''),[notice,setNotice]=useState(''),[busy,setBusy]=useState(false),[complaint,setComplaint]=useState<'refund_request'|'payment_claim'|null>(null);
+ const load=()=>api<any>(`/orders/${id}`).then(setData).catch(e=>setError(e.message));
+ useEffect(()=>{void load();},[id]);
+ const transition=async(status:string,expectedStatus?:string)=>{setBusy(true);setError('');try{await api(`/orders/${id}/transition`,{method:'POST',body:JSON.stringify({status,...expectedStatus&&{expectedStatus}})});await load();}catch(e){setError(e instanceof Error?e.message:'Order update failed.');}finally{setBusy(false);}};
+ const complete=async()=>{if(await confirmAction('Confirm that the delivered work is complete? This will release eligible simulated Freelancer earnings.'))await transition('completed');};
+ const submitIssue=async(e:FormEvent<HTMLFormElement>)=>{e.preventDefault();if(!complaint||busy)return;const reason=String(new FormData(e.currentTarget).get('reason')||'').trim();if(reason.length<5){setError('Please provide at least five characters.');return;}setBusy(true);setError('');try{await api(`/orders/${id}/issues`,{method:'POST',body:JSON.stringify({issueType:complaint,reason})});setComplaint(null);setNotice('Complaint submitted for Admin review.');await load();}catch(e){setError(e instanceof Error?e.message:'Complaint submission failed.');}finally{setBusy(false);}};
+ const submitWork=async(e:FormEvent<HTMLFormElement>)=>{e.preventDefault();const form=new FormData(e.currentTarget),deliveryUrl=String(form.get('deliveryUrl')||'').trim(),file=form.get('file') as File;if(!deliveryUrl&&!file?.size){setError('Provide a Work Delivery URL or upload a report.');return;}if(!await confirmAction('Submit this delivery URL and report to the Customer?'))return;setBusy(true);setError('');try{let mediaPath:string|undefined;if(file?.size){const upload=new FormData();upload.set('file',file);upload.set('kind','deliverable');upload.set('orderId',String(id));mediaPath=(await api<{path:string}>('/media',{method:'POST',body:upload})).path;}await api(`/orders/${id}/deliverables`,{method:'POST',body:JSON.stringify({deliveryUrl:deliveryUrl||undefined,mediaPath})});await load();}catch(e){setError(e instanceof Error?e.message:'Work submission failed.');}finally{setBusy(false);}};
+ if(error&&!data)return <div className="page alert">{error}</div>;
+ if(!data)return <div className="page">Loading order…</div>;
+ const o=data.order,isBuyer=user?.id===o.buyer_id,isSeller=user?.id===o.seller_id;
+ return <div className="page narrow"><Link to="/orders">← Orders</Link><h1>{o.title_snapshot}</h1><StatusBadge status={o.status}/>
+  <div className="pricebox"><span>{isBuyer?'Freelancer':'Customer'} · {o.seller_name_snapshot}</span><b>{money(o.price_snapshot)}</b><small>{new Date(o.created_at).toLocaleString('id-ID')}</small></div>
+  <section className="formcard"><h2>Project request</h2><p>{o.project_brief}</p>{o.buyer_phone_snapshot&&<p>Customer contact: {o.buyer_phone_snapshot}</p>}<p>Payment: {o.payment_status==='simulated'?'Simulated':o.payment_status==='awaiting_payment'?'Awaiting simulation':'Historical payment not tracked'}{o.payment_method&&` · ${o.payment_method}`}</p></section>
+  {error&&<div className="alert" role="alert">{error}</div>}{notice&&<p className="feedback" role="status">{notice}</p>}
+  {isBuyer&&o.status==='pending'&&o.payment_status==='awaiting_payment'&&<PaymentSimulation batchId={o.checkout_batch_id} method={o.payment_method} provider={o.payment_provider} amount={o.payment_amount??o.price_snapshot} subtotal={o.payment_subtotal} tax={o.payment_tax} phone={o.buyer_phone_snapshot||undefined} onComplete={()=>void load()}/>}
+  {isSeller&&o.status==='accepted'&&<button className="button" disabled={busy} onClick={()=>void transition('in_progress')}>Start work</button>}
+  {isSeller&&o.status==='in_progress'&&<form className="formcard" onSubmit={e=>void submitWork(e)}><h2>Submit work</h2><label>Work Delivery URL<input type="url" name="deliveryUrl" placeholder="https://"/></label><label>Upload Report (PDF, DOC, DOCX, PNG or JPG; max 5 MB)<input type="file" name="file" accept="application/pdf,.doc,.docx,image/png,image/jpeg"/></label><button className="button" disabled={busy}>{busy?'Submitting…':'Submit work'}</button></form>}
+  {isBuyer&&o.status==='work_submitted'&&data.deliverables.some((d:any)=>d.delivery_url||d.media_path)&&<button className="button" disabled={busy} onClick={()=>void complete()}>Confirm completion</button>}
+  {isBuyer&&o.status==='work_submitted'&&<button className="button outline" disabled={busy} onClick={()=>setComplaint('refund_request')}>File a Refund Complaint</button>}
+  {isSeller&&o.status==='work_submitted'&&<button className="button outline" disabled={busy} onClick={()=>setComplaint('payment_claim')}>File a Payment Complaint</button>}
+  {complaint&&o.status==='work_submitted'&&<form className="formcard" onSubmit={submitIssue}><h2>{complaint==='refund_request'?'File a Refund Complaint':'File a Payment Complaint'}</h2><p>{complaint==='refund_request'?'Request Admin review of a problem with the submitted work.':'Request Admin review of the submitted order payment.'}</p><label>Reason<textarea name="reason" minLength={5} maxLength={2000} required rows={4}/></label><div className="orderactions"><button type="button" className="button outline" disabled={busy} onClick={()=>setComplaint(null)}>Cancel</button><button className="button" disabled={busy}>{busy?'Submitting…':'Submit complaint'}</button></div></form>}
+  {data.deliverables.length>0&&<section><h2>Work deliverables</h2>{data.deliverables.map((d:any)=><article className="order" key={d.id}><div>{d.delivery_url&&<p><a href={d.delivery_url} target="_blank" rel="noreferrer">Open Work Delivery URL ↗</a></p>}{d.message&&<p>{d.message}</p>}{d.media_path&&<p><a href={d.media_path}>Download report</a></p>}<small>{d.seller_name} · {new Date(d.created_at).toLocaleString('id-ID')}</small></div></article>)}</section>}
+  <h2>Order history</h2>{data.events.map((event:any)=><article className="order" key={`${event.to_status}-${event.created_at}`}><div><b>{event.from_status?`${statusLabel(event.from_status)} → `:''}{statusLabel(event.to_status)}</b><p>{event.actor_name} · {new Date(event.created_at).toLocaleString('id-ID')}</p>{event.reason&&<small>{event.reason}</small>}</div></article>)}
+ </div>;
+}
